@@ -1,379 +1,332 @@
-// ---------------------------------------------------------------------------
-// llama_jni.cpp — most JNI pomiędzy Kotlin (LlamaEngine) a llama.cpp.
-//
-// Implementacja jest napisana pod API llama.cpp z tagu b3456. Sampling jest
-// zaimplementowany ręcznie (temp / top-k / top-p / repeat penalty) na surowych
-// logitach, aby uniezależnić kod od zmiennego API samplera w llama.cpp.
-// ---------------------------------------------------------------------------
 #include <jni.h>
 #include <android/log.h>
-
-#include <algorithm>
-#include <cmath>
-#include <cstring>
-#include <mutex>
-#include <random>
 #include <string>
 #include <vector>
+#include <cmath>
+#include <cstring>
+#include <algorithm>
+#include <random>
+#include <sstream>
 
 #include "llama.h"
 
-#define LOG_TAG "LlamaJNI"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#define TAG "LlamaJNI"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
 // ---------------------------------------------------------------------------
-// Stan globalny (pojedyncza instancja silnika)
+// Stan globalny modelu
 // ---------------------------------------------------------------------------
-static llama_model*   g_model    = nullptr;
-static llama_context* g_ctx      = nullptr;
-static int            g_n_ctx    = 0;
-static int            g_n_threads = 4;
-static bool           g_backend_ready = false;
-static std::mutex     g_mutex;
-static std::mt19937   g_rng(std::random_device{}());
+static struct llama_model   * g_model   = nullptr;
+static struct llama_context * g_ctx     = nullptr;
+static bool                   g_loaded  = false;
 
 // ---------------------------------------------------------------------------
-// Pomocnicze
+// Pomocnicze: tokenizacja
 // ---------------------------------------------------------------------------
-
-// Tokenizacja tekstu na wektor tokenów.
-static std::vector<llama_token> tokenize(const std::string& text, bool add_bos) {
-    int n_max = (int) text.size() + 16;
-    std::vector<llama_token> result(n_max);
-    int n = llama_tokenize(g_model, text.c_str(), (int) text.size(),
-                           result.data(), (int) result.size(), add_bos, true);
-    if (n < 0) {
-        result.resize(-n);
-        n = llama_tokenize(g_model, text.c_str(), (int) text.size(),
-                           result.data(), (int) result.size(), add_bos, true);
-    }
-    result.resize(std::max(0, n));
-    return result;
+static std::vector<llama_token> tokenize(const std::string & text, bool add_bos) {
+    const llama_vocab * vocab = llama_model_get_vocab(g_model);
+    int n = llama_tokenize(vocab, text.c_str(), (int32_t)text.size(),
+                           nullptr, 0, add_bos, true);
+    if (n < 0) n = -n;
+    std::vector<llama_token> tokens(n);
+    llama_tokenize(vocab, text.c_str(), (int32_t)text.size(),
+                   tokens.data(), (int32_t)tokens.size(), add_bos, true);
+    return tokens;
 }
 
-// Zamiana pojedynczego tokenu na fragment tekstu (bajty).
-static std::string token_to_piece(llama_token token) {
+// ---------------------------------------------------------------------------
+// Pomocnicze: token -> string
+// ---------------------------------------------------------------------------
+static std::string token_to_str(llama_token token) {
+    const llama_vocab * vocab = llama_model_get_vocab(g_model);
     char buf[256];
-    int n = llama_token_to_piece(g_model, token, buf, sizeof(buf), 0, true);
-    if (n < 0) {
-        std::string result((size_t)(-n), '\0');
-        int n2 = llama_token_to_piece(g_model, token, &result[0], (int) result.size(), 0, true);
-        result.resize(std::max(0, n2));
-        return result;
-    }
-    return std::string(buf, buf + n);
+    int n = llama_token_to_piece(vocab, token, buf, sizeof(buf), 0, true);
+    if (n < 0) return "";
+    return std::string(buf, n);
 }
 
-// Długość najdłuższego poprawnego prefiksu UTF-8 (aby nie emitować urwanych bajtów).
-static size_t utf8_valid_prefix_len(const std::string& s) {
-    size_t i = 0;
-    const size_t n = s.size();
-    while (i < n) {
-        unsigned char c = (unsigned char) s[i];
-        size_t len;
-        if      (c < 0x80) len = 1;
-        else if ((c >> 5) == 0x6) len = 2;
-        else if ((c >> 4) == 0xE) len = 3;
-        else if ((c >> 3) == 0x1E) len = 4;
-        else { len = 1; } // nieprawidłowy bajt startowy — traktuj jako 1
-        if (i + len > n) break; // niekompletny znak — zatrzymaj się tutaj
-        i += len;
-    }
-    return i;
-}
+// ---------------------------------------------------------------------------
+// Ręczny sampler (greedy + temperature + top-k + top-p + repeat penalty)
+// ---------------------------------------------------------------------------
+static llama_token sample_token(
+        struct llama_context * ctx,
+        const std::vector<llama_token> & last_tokens,
+        float temperature, float top_p, int top_k, float repeat_penalty)
+{
+    const llama_vocab * vocab = llama_model_get_vocab(g_model);
+    int n_vocab = llama_vocab_n_tokens(vocab);
 
-// Zdekodowanie listy tokenów. Ustawia logits tylko dla ostatniego tokenu.
-// Zwraca wskaźnik na logity ostatniego tokenu lub nullptr przy błędzie.
-static float* decode_tokens(const std::vector<llama_token>& tokens, int n_past) {
-    const int n_batch = 512;
-    int n = (int) tokens.size();
-    if (n == 0) return nullptr;
+    float * logits = llama_get_logits(ctx);
+    std::vector<std::pair<float,int>> candidates(n_vocab);
+    for (int i = 0; i < n_vocab; i++) candidates[i] = {logits[i], i};
 
-    for (int start = 0; start < n; start += n_batch) {
-        int cur = std::min(n_batch, n - start);
-        bool last_chunk = (start + cur >= n);
-
-        llama_batch batch = llama_batch_init(cur, 0, 1);
-        for (int i = 0; i < cur; i++) {
-            batch.token[i]     = tokens[start + i];
-            batch.pos[i]       = n_past + start + i;
-            batch.n_seq_id[i]  = 1;
-            batch.seq_id[i][0] = 0;
-            batch.logits[i]    = false;
-        }
-        if (last_chunk) {
-            batch.logits[cur - 1] = true;
-        }
-        batch.n_tokens = cur;
-
-        int rc = llama_decode(g_ctx, batch);
-        llama_batch_free(batch);
-        if (rc != 0) {
-            LOGE("llama_decode zwrócił %d", rc);
-            return nullptr;
+    // Repeat penalty
+    if (repeat_penalty != 1.0f && !last_tokens.empty()) {
+        for (auto tok : last_tokens) {
+            if (tok >= 0 && tok < n_vocab) {
+                auto & lp = candidates[tok].first;
+                lp = lp > 0 ? lp / repeat_penalty : lp * repeat_penalty;
+            }
         }
     }
-    return llama_get_logits_ith(g_ctx, -1);
-}
 
-// Ręczny sampling z logitów.
-static llama_token sample_token(float* logits,
-                                const std::vector<llama_token>& recent,
-                                float temp, float top_p, int top_k,
-                                float repeat_penalty) {
-    const int n_vocab = llama_n_vocab(g_model);
-
-    // Kara za powtórzenia (repeat penalty) — na ostatnich ~64 tokenach.
-    int repeat_last_n = 64;
-    int from = std::max(0, (int) recent.size() - repeat_last_n);
-    for (int i = from; i < (int) recent.size(); i++) {
-        llama_token t = recent[i];
-        if (t < 0 || t >= n_vocab) continue;
-        if (logits[t] > 0) logits[t] /= repeat_penalty;
-        else               logits[t] *= repeat_penalty;
+    // Greedy
+    if (temperature <= 0.0f) {
+        return (llama_token)std::max_element(candidates.begin(), candidates.end())->second;
     }
 
-    struct Candidate { llama_token id; float logit; };
-    std::vector<Candidate> cands;
-    cands.reserve(n_vocab);
-    for (int i = 0; i < n_vocab; i++) {
-        cands.push_back({ (llama_token) i, logits[i] });
+    // Temperature
+    for (auto & c : candidates) c.first /= temperature;
+
+    // Softmax
+    float max_l = std::max_element(candidates.begin(), candidates.end())->first;
+    float sum = 0.0f;
+    for (auto & c : candidates) { c.first = std::exp(c.first - max_l); sum += c.first; }
+    for (auto & c : candidates) c.first /= sum;
+
+    // Top-K
+    if (top_k > 0 && top_k < n_vocab) {
+        std::partial_sort(candidates.begin(), candidates.begin() + top_k,
+                          candidates.end(), [](auto & a, auto & b){ return a.first > b.first; });
+        candidates.resize(top_k);
+        float s2 = 0; for (auto & c : candidates) s2 += c.first;
+        for (auto & c : candidates) c.first /= s2;
     }
 
-    // Greedy jeśli temperatura <= 0.
-    if (temp <= 0.0f) {
-        auto best = std::max_element(cands.begin(), cands.end(),
-            [](const Candidate& a, const Candidate& b) { return a.logit < b.logit; });
-        return best->id;
-    }
-
-    // Sortuj malejąco wg logitów.
-    std::sort(cands.begin(), cands.end(),
-        [](const Candidate& a, const Candidate& b) { return a.logit > b.logit; });
-
-    // Top-K.
-    if (top_k > 0 && top_k < (int) cands.size()) {
-        cands.resize(top_k);
-    }
-
-    // Softmax z temperaturą.
-    float max_logit = cands[0].logit;
-    double sum = 0.0;
-    std::vector<double> probs(cands.size());
-    for (size_t i = 0; i < cands.size(); i++) {
-        double p = std::exp((cands[i].logit - max_logit) / temp);
-        probs[i] = p;
-        sum += p;
-    }
-    for (size_t i = 0; i < probs.size(); i++) probs[i] /= sum;
-
-    // Top-P (nucleus).
+    // Top-P
     if (top_p < 1.0f) {
-        double cum = 0.0;
-        size_t cutoff = probs.size();
-        for (size_t i = 0; i < probs.size(); i++) {
-            cum += probs[i];
-            if (cum >= top_p) { cutoff = i + 1; break; }
+        std::sort(candidates.begin(), candidates.end(), [](auto & a, auto & b){ return a.first > b.first; });
+        float cumsum = 0;
+        size_t last = candidates.size();
+        for (size_t i = 0; i < candidates.size(); i++) {
+            cumsum += candidates[i].first;
+            if (cumsum >= top_p) { last = i + 1; break; }
         }
-        cands.resize(cutoff);
-        probs.resize(cutoff);
-        double s = 0.0;
-        for (double p : probs) s += p;
-        for (double& p : probs) p /= s;
+        candidates.resize(last);
+        float s2 = 0; for (auto & c : candidates) s2 += c.first;
+        for (auto & c : candidates) c.first /= s2;
     }
 
-    // Losowanie z rozkładu.
+    // Losuj
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::vector<float> probs(candidates.size());
+    for (size_t i = 0; i < candidates.size(); i++) probs[i] = candidates[i].first;
     std::discrete_distribution<int> dist(probs.begin(), probs.end());
-    int idx = dist(g_rng);
-    return cands[idx].id;
+    return (llama_token)candidates[dist(gen)].second;
 }
 
 // ---------------------------------------------------------------------------
-// Funkcje JNI
+// JNI: inicjalizacja modelu
 // ---------------------------------------------------------------------------
-extern "C" {
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_llamaagent_LlamaEngine_nativeInit(
+        JNIEnv * env, jobject /*thiz*/,
+        jstring modelPath, jint nThreads, jint nCtx)
+{
+    // Zwolnij poprzedni model jeśli był
+    if (g_ctx)   { llama_free(g_ctx);        g_ctx   = nullptr; }
+    if (g_model) { llama_model_free(g_model); g_model = nullptr; }
+    g_loaded = false;
 
-JNIEXPORT jboolean JNICALL
-Java_com_llamaagent_LlamaEngine_nativeInit(JNIEnv* env, jobject /*thiz*/,
-                                           jstring modelPath, jint nThreads, jint nCtx) {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    llama_backend_init();
 
-    if (!g_backend_ready) {
-        llama_backend_init();
-        g_backend_ready = true;
-    }
+    const char * path = env->GetStringUTFChars(modelPath, nullptr);
+    LOGI("Ładowanie modelu: %s", path);
 
-    // Zwolnij poprzedni model jeśli istnieje.
-    if (g_ctx)   { llama_free(g_ctx);        g_ctx = nullptr; }
-    if (g_model) { llama_free_model(g_model); g_model = nullptr; }
+    struct llama_model_params mparams = llama_model_default_params();
+    mparams.n_gpu_layers = 0; // CPU only na Androidzie
 
-    const char* path = env->GetStringUTFChars(modelPath, nullptr);
-    std::string model_path(path ? path : "");
+    g_model = llama_model_load_from_file(path, mparams);
     env->ReleaseStringUTFChars(modelPath, path);
 
-    LOGI("Ładowanie modelu: %s (threads=%d, ctx=%d)", model_path.c_str(), (int)nThreads, (int)nCtx);
-
-    llama_model_params mparams = llama_model_default_params();
-    mparams.n_gpu_layers = 0; // CPU-only na Androidzie
-
-    g_model = llama_load_model_from_file(model_path.c_str(), mparams);
     if (!g_model) {
-        LOGE("Nie udało się załadować modelu: %s", model_path.c_str());
+        LOGE("Nie udało się załadować modelu!");
         return JNI_FALSE;
     }
 
-    g_n_threads = (int) nThreads;
+    struct llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx     = (uint32_t)nCtx;
+    cparams.n_threads = (uint32_t)nThreads;
+    cparams.n_threads_batch = (uint32_t)nThreads;
 
-    llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx         = (uint32_t) nCtx;
-    cparams.n_threads     = nThreads;
-    cparams.n_threads_batch = nThreads;
-    cparams.n_batch       = 512;
-
-    g_ctx = llama_new_context_with_model(g_model, cparams);
+    g_ctx = llama_init_from_model(g_model, cparams);
     if (!g_ctx) {
-        LOGE("Nie udało się utworzyć kontekstu");
-        llama_free_model(g_model);
+        LOGE("Nie udało się utworzyć kontekstu!");
+        llama_model_free(g_model);
         g_model = nullptr;
         return JNI_FALSE;
     }
 
-    g_n_ctx = (int) llama_n_ctx(g_ctx);
-    LOGI("Model załadowany. n_ctx=%d", g_n_ctx);
+    g_loaded = true;
+    LOGI("Model załadowany pomyślnie. n_ctx=%d, n_threads=%d", nCtx, nThreads);
     return JNI_TRUE;
 }
 
-// Wspólny rdzeń generacji. Jeśli callback != nullptr, tokeny są przesyłane
-// strumieniowo; w przeciwnym razie akumulowane i zwracane jako całość.
-static std::string run_generation(JNIEnv* env, const std::string& prompt,
-                                  int maxTokens, float temp, float top_p, int top_k,
-                                  float repeat_penalty, jobject callback,
-                                  jmethodID onToken) {
-    std::string output;
+// ---------------------------------------------------------------------------
+// JNI: generacja (blokująca)
+// ---------------------------------------------------------------------------
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_llamaagent_LlamaEngine_nativeGenerate(
+        JNIEnv * env, jobject /*thiz*/,
+        jstring prompt, jint maxTokens,
+        jfloat temperature, jfloat topP, jint topK, jfloat repeatPenalty)
+{
+    if (!g_loaded) {
+        return env->NewStringUTF("[BŁĄD: Model nie jest załadowany]");
+    }
 
-    std::vector<llama_token> tokens = tokenize(prompt, true);
+    const char * prompt_cstr = env->GetStringUTFChars(prompt, nullptr);
+    std::string prompt_str(prompt_cstr);
+    env->ReleaseStringUTFChars(prompt, prompt_cstr);
+
+    // Tokenizacja
+    std::vector<llama_token> tokens = tokenize(prompt_str, true);
     if (tokens.empty()) {
-        return output;
-    }
-    if ((int) tokens.size() >= g_n_ctx) {
-        // Przytnij prompt do rozmiaru kontekstu (zostaw miejsce na generację).
-        int keep = g_n_ctx - 8;
-        if (keep < 1) keep = 1;
-        tokens.erase(tokens.begin(), tokens.end() - std::min((int)tokens.size(), keep));
-    }
-
-    llama_kv_cache_clear(g_ctx);
-
-    float* logits = decode_tokens(tokens, 0);
-    if (!logits) return output;
-
-    std::vector<llama_token> recent = tokens;
-    int n_past = (int) tokens.size();
-    llama_token eos = llama_token_eos(g_model);
-
-    std::string pending; // bufor bajtów dla poprawnego UTF-8
-
-    for (int i = 0; i < maxTokens; i++) {
-        if (n_past >= g_n_ctx) break;
-
-        llama_token id = sample_token(logits, recent, temp, top_p, top_k, repeat_penalty);
-        if (id == eos) break;
-
-        pending += token_to_piece(id);
-        size_t valid = utf8_valid_prefix_len(pending);
-        if (valid > 0) {
-            std::string chunk = pending.substr(0, valid);
-            pending.erase(0, valid);
-            output += chunk;
-            if (callback && onToken) {
-                jstring jchunk = env->NewStringUTF(chunk.c_str());
-                env->CallVoidMethod(callback, onToken, jchunk);
-                env->DeleteLocalRef(jchunk);
-                if (env->ExceptionCheck()) { env->ExceptionClear(); break; }
-            }
-        }
-
-        recent.push_back(id);
-
-        std::vector<llama_token> next = { id };
-        logits = decode_tokens(next, n_past);
-        if (!logits) break;
-        n_past++;
-    }
-
-    return output;
-}
-
-JNIEXPORT jstring JNICALL
-Java_com_llamaagent_LlamaEngine_nativeGenerate(JNIEnv* env, jobject /*thiz*/,
-                                               jstring prompt, jint maxTokens, jfloat temp,
-                                               jfloat topP, jint topK, jfloat repeatPenalty) {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    if (!g_ctx || !g_model) {
         return env->NewStringUTF("");
     }
-    const char* p = env->GetStringUTFChars(prompt, nullptr);
-    std::string prompt_str(p ? p : "");
-    env->ReleaseStringUTFChars(prompt, p);
 
-    std::string out = run_generation(env, prompt_str, (int)maxTokens, (float)temp,
-                                     (float)topP, (int)topK, (float)repeatPenalty,
-                                     nullptr, nullptr);
-    return env->NewStringUTF(out.c_str());
+    llama_memory_clear(llama_get_memory(g_ctx), false);
+
+    // Przetwórz prompt
+    struct llama_batch batch = llama_batch_get_one(tokens.data(), (int32_t)tokens.size());
+    if (llama_decode(g_ctx, batch) != 0) {
+        return env->NewStringUTF("[BŁĄD: Nie można zdekodować promptu]");
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(g_model);
+    llama_token eos = llama_vocab_eos(vocab);
+    llama_token eot = llama_vocab_eot(vocab);
+
+    std::string result;
+    std::vector<llama_token> last_tokens(tokens.begin(), tokens.end());
+
+    for (int i = 0; i < maxTokens; i++) {
+        llama_token tok = sample_token(g_ctx, last_tokens,
+                                       temperature, topP, topK, repeatPenalty);
+
+        if (tok == eos || tok == eot) break;
+
+        result += token_to_str(tok);
+        last_tokens.push_back(tok);
+        if (last_tokens.size() > 64) last_tokens.erase(last_tokens.begin());
+
+        // Następny krok
+        struct llama_batch next = llama_batch_get_one(&tok, 1);
+        if (llama_decode(g_ctx, next) != 0) break;
+    }
+
+    return env->NewStringUTF(result.c_str());
 }
 
-JNIEXPORT void JNICALL
-Java_com_llamaagent_LlamaEngine_nativeGenerateStream(JNIEnv* env, jobject /*thiz*/,
-                                                     jstring prompt, jint maxTokens, jfloat temp,
-                                                     jfloat topP, jint topK, jfloat repeatPenalty,
-                                                     jobject callback) {
-    std::lock_guard<std::mutex> lock(g_mutex);
+// ---------------------------------------------------------------------------
+// Callback interface dla streamingu
+// ---------------------------------------------------------------------------
+static jclass    g_callback_class  = nullptr;
+static jmethodID g_on_token_method = nullptr;
+static jmethodID g_on_complete_method = nullptr;
+static jmethodID g_on_error_method = nullptr;
 
-    jclass cbClass = env->GetObjectClass(callback);
-    jmethodID onToken    = env->GetMethodID(cbClass, "onToken",    "(Ljava/lang/String;)V");
-    jmethodID onComplete = env->GetMethodID(cbClass, "onComplete", "()V");
-    jmethodID onError    = env->GetMethodID(cbClass, "onError",    "(Ljava/lang/String;)V");
-
-    if (!g_ctx || !g_model) {
-        if (onError) {
-            jstring msg = env->NewStringUTF("Model nie jest załadowany");
-            env->CallVoidMethod(callback, onError, msg);
-            env->DeleteLocalRef(msg);
-        }
+// ---------------------------------------------------------------------------
+// JNI: generacja strumieniowa
+// ---------------------------------------------------------------------------
+extern "C" JNIEXPORT void JNICALL
+Java_com_llamaagent_LlamaEngine_nativeGenerateStream(
+        JNIEnv * env, jobject /*thiz*/,
+        jstring prompt, jint maxTokens,
+        jfloat temperature, jfloat topP, jint topK, jfloat repeatPenalty,
+        jobject callback)
+{
+    if (!g_loaded) {
+        jclass cb_cls = env->GetObjectClass(callback);
+        jmethodID err = env->GetMethodID(cb_cls, "onError", "(Ljava/lang/String;)V");
+        jstring msg = env->NewStringUTF("Model nie jest załadowany");
+        env->CallVoidMethod(callback, err, msg);
+        env->DeleteLocalRef(msg);
         return;
     }
 
-    const char* p = env->GetStringUTFChars(prompt, nullptr);
-    std::string prompt_str(p ? p : "");
-    env->ReleaseStringUTFChars(prompt, p);
+    jclass cb_cls = env->GetObjectClass(callback);
+    jmethodID on_token    = env->GetMethodID(cb_cls, "onToken",    "(Ljava/lang/String;)V");
+    jmethodID on_complete = env->GetMethodID(cb_cls, "onComplete", "()V");
+    jmethodID on_error    = env->GetMethodID(cb_cls, "onError",    "(Ljava/lang/String;)V");
 
-    run_generation(env, prompt_str, (int)maxTokens, (float)temp,
-                   (float)topP, (int)topK, (float)repeatPenalty,
-                   callback, onToken);
+    const char * prompt_cstr = env->GetStringUTFChars(prompt, nullptr);
+    std::string prompt_str(prompt_cstr);
+    env->ReleaseStringUTFChars(prompt, prompt_cstr);
 
-    if (onComplete) {
-        env->CallVoidMethod(callback, onComplete);
+    std::vector<llama_token> tokens = tokenize(prompt_str, true);
+    if (tokens.empty()) {
+        env->CallVoidMethod(callback, on_complete);
+        return;
     }
+
+    llama_memory_clear(llama_get_memory(g_ctx), false);
+
+    struct llama_batch batch = llama_batch_get_one(tokens.data(), (int32_t)tokens.size());
+    if (llama_decode(g_ctx, batch) != 0) {
+        jstring msg = env->NewStringUTF("Błąd dekodowania promptu");
+        env->CallVoidMethod(callback, on_error, msg);
+        env->DeleteLocalRef(msg);
+        return;
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(g_model);
+    llama_token eos = llama_vocab_eos(vocab);
+    llama_token eot = llama_vocab_eot(vocab);
+
+    std::vector<llama_token> last_tokens(tokens.begin(), tokens.end());
+
+    for (int i = 0; i < maxTokens; i++) {
+        llama_token tok = sample_token(g_ctx, last_tokens,
+                                       temperature, topP, topK, repeatPenalty);
+
+        if (tok == eos || tok == eot) break;
+
+        std::string piece = token_to_str(tok);
+        jstring jpiece = env->NewStringUTF(piece.c_str());
+        env->CallVoidMethod(callback, on_token, jpiece);
+        env->DeleteLocalRef(jpiece);
+
+        last_tokens.push_back(tok);
+        if (last_tokens.size() > 64) last_tokens.erase(last_tokens.begin());
+
+        struct llama_batch next = llama_batch_get_one(&tok, 1);
+        if (llama_decode(g_ctx, next) != 0) break;
+    }
+
+    env->CallVoidMethod(callback, on_complete);
 }
 
-JNIEXPORT void JNICALL
-Java_com_llamaagent_LlamaEngine_nativeFree(JNIEnv* /*env*/, jobject /*thiz*/) {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_ctx)   { llama_free(g_ctx);        g_ctx = nullptr; }
-    if (g_model) { llama_free_model(g_model); g_model = nullptr; }
-    g_n_ctx = 0;
-    LOGI("Zasoby modelu zwolnione");
+// ---------------------------------------------------------------------------
+// JNI: zwolnienie zasobów
+// ---------------------------------------------------------------------------
+extern "C" JNIEXPORT void JNICALL
+Java_com_llamaagent_LlamaEngine_nativeFree(JNIEnv * /*env*/, jobject /*thiz*/)
+{
+    if (g_ctx)   { llama_free(g_ctx);        g_ctx   = nullptr; }
+    if (g_model) { llama_model_free(g_model); g_model = nullptr; }
+    llama_backend_free();
+    g_loaded = false;
+    LOGI("Model zwolniony.");
 }
 
-JNIEXPORT jint JNICALL
-Java_com_llamaagent_LlamaEngine_nativeGetContextSize(JNIEnv* /*env*/, jobject /*thiz*/) {
-    return (jint) g_n_ctx;
+// ---------------------------------------------------------------------------
+// JNI: rozmiar kontekstu
+// ---------------------------------------------------------------------------
+extern "C" JNIEXPORT jint JNICALL
+Java_com_llamaagent_LlamaEngine_nativeGetContextSize(JNIEnv * /*env*/, jobject /*thiz*/)
+{
+    if (!g_ctx) return 0;
+    return (jint)llama_n_ctx(g_ctx);
 }
 
-JNIEXPORT jboolean JNICALL
-Java_com_llamaagent_LlamaEngine_nativeIsLoaded(JNIEnv* /*env*/, jobject /*thiz*/) {
-    return (g_ctx != nullptr && g_model != nullptr) ? JNI_TRUE : JNI_FALSE;
+// ---------------------------------------------------------------------------
+// JNI: czy model załadowany
+// ---------------------------------------------------------------------------
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_llamaagent_LlamaEngine_nativeIsLoaded(JNIEnv * /*env*/, jobject /*thiz*/)
+{
+    return g_loaded ? JNI_TRUE : JNI_FALSE;
 }
-
-} // extern "C"

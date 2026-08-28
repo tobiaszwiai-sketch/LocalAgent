@@ -12,3 +12,8 @@ app/build/
 *.apk
 *.aab
 *.gguf
+
+# Prebuilt biblioteki natywne llama.cpp (~79MB) — za duze na GitHub bez LFS.
+# Pobierz je z GitHub Releases llama.cpp (instrukcja w AGENT_CONTEXT.md).
+app/src/main/jniLibs/
+*.so
