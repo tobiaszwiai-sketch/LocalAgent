@@ -12,6 +12,7 @@
 #include "ggml-backend.h"
 #include <cerrno>
 #include <cstdio>
+#include <dlfcn.h>
 
 #define TAG "LlamaJNI"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
@@ -133,14 +134,43 @@ Java_com_llamaagent_LlamaEngine_nativeInitBackends(
 {
     if (g_backends_loaded) return;
 
+    // Strategia na Androidzie:
+    // System.load() w Kotlinie załadował już libggml-cpu-android_*.so przez
+    // ClassLoader (właściwy namespace). Teraz szukamy ggml_backend_cpu_reg
+    // przez dlsym(RTLD_DEFAULT) — przeszukuje WSZYSTKIE załadowane biblioteki.
+    typedef ggml_backend_reg_t (*reg_fn_t)(void);
+
+    int manually_registered = 0;
+    void * sym = dlsym(RTLD_DEFAULT, "ggml_backend_cpu_reg");
+    if (sym) {
+        reg_fn_t cpu_reg_fn = reinterpret_cast<reg_fn_t>(sym);
+        ggml_backend_reg_t reg = cpu_reg_fn();
+        if (reg) {
+            ggml_backend_register(reg);
+            LOGI("Zarejestrowano CPU backend przez dlsym: %s", ggml_backend_reg_name(reg));
+            manually_registered++;
+        } else {
+            LOGE("ggml_backend_cpu_reg() zwrocilo NULL");
+        }
+    } else {
+        LOGE("dlsym(ggml_backend_cpu_reg) = NULL — biblioteki CPU nie zostały załadowane przez Kotlin!");
+    }
+
+    // Fallback: spróbuj też ggml_backend_load_all_from_path (może działać jeśli
+    // Android pozwoli na dlopen po tym jak biblioteki są już w przestrzeni proc)
     const char * dir = env->GetStringUTFChars(nativeLibDir, nullptr);
-    LOGI("Ładowanie backendów GGML z: %s", dir);
+    LOGI("Fallback: ggml_backend_load_all_from_path(%s)", dir);
     ggml_backend_load_all_from_path(dir);
     env->ReleaseStringUTFChars(nativeLibDir, dir);
 
     int n_backends = (int)ggml_backend_reg_count();
     int n_devices  = (int)ggml_backend_dev_count();
-    LOGI("Załadowano backendów: %d, urządzeń: %d", n_backends, n_devices);
+    LOGI("Zarejestrowano recznie: %d | Lacznie backendow: %d, urzadzen: %d",
+         manually_registered, n_backends, n_devices);
+
+    if (n_backends == 0) {
+        LOGE("KRYTYCZNY BLAD: brak backendow CPU! Model nie moze dzialac.");
+    }
 
     g_backends_loaded = true;
 }

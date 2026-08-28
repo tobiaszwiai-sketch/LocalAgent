@@ -5,9 +5,9 @@
 ---
 
 ## Stan projektu
-- **Wersja:** 1.2.0
+- **Wersja:** 1.4.0
 - **Ostatnia aktualizacja:** 2025-08 przez Claude (Abacus AI Agent)
-- **Status:** ✅ APK skompilowany — poprawka krytycznego błędu ładowania modelu
+- **Status:** ✅ APK skompilowany — poprawka krytyczna: linker namespace Android + wyszukiwanie pliku case-insensitive
 
 ---
 
@@ -173,6 +173,8 @@ Na świeżej maszynie z FetchContent (stare podejście) trwałoby 30-60 minut.
 | 2025-08 | Claude (Abacus AI) | Inicjalny projekt, JNI + Compose UI + Agent |
 | 2025-08 | Claude (Abacus AI) | Przejście na prebuilt .so (b10665), fix API llama.cpp, kompilacja APK |
 | 2025-08 | Claude (Abacus AI) | **v1.2.0** — krytyczna poprawka: backend CPU nie ładował się na Androidzie |
+| 2025-08 | Claude (Abacus AI) | **v1.3.0** — poprawka: wyszukiwanie pliku GGUF case-insensitive, lepsza diagnostyka błędów |
+| 2025-08 | Claude (Abacus AI) | **v1.4.0** — krytyczna poprawka: Android linker namespace blokuje dlopen z C, obejście przez System.load() + dlsym(RTLD_DEFAULT) |
 
 ---
 
@@ -209,3 +211,62 @@ Backendy nie były ładowane → model nie miał zdefiniowanego backendu oblicze
 - `app/src/main/java/com/llamaagent/LlamaEngine.kt` — kolejność loadLibrary + external fun
 - `app/src/main/java/com/llamaagent/LlamaAgentApp.kt` — NOWY plik
 - `app/src/main/AndroidManifest.xml` — android:name=".LlamaAgentApp"
+
+---
+
+## Szczegóły naprawy v1.3.0 (plik GGUF nie znajdowany)
+
+### Przyczyna
+Aplikacja szukała pliku `qwen3-1.7b-q4_k_m.gguf` (małe litery), a rzeczywisty plik na
+telefonie nazywał się `Qwen3-1.7B-Q4_K_M.gguf` (mieszane wielkości liter). System plików
+Android jest case-sensitive na ext4, więc plik nie był znajdowany.
+
+### Rozwiązanie
+- `ModelStorage.kt` — wyszukiwanie pliku GGUF teraz używa porównania case-insensitive
+  (`name.equals(expected, ignoreCase = true)`), sprawdza kilka potencjalnych katalogów
+- `ChatViewModel.kt` — szczegółowy komunikat błędu pokazujący pełną ścieżkę pliku
+- `MainActivity.kt` — automatyczne zapytanie o `MANAGE_EXTERNAL_STORAGE` przy starcie
+
+### Zmodyfikowane pliki
+- `app/src/main/java/com/llamaagent/data/ModelStorage.kt`
+- `app/src/main/java/com/llamaagent/viewmodel/ChatViewModel.kt`
+- `app/src/main/java/com/llamaagent/MainActivity.kt`
+
+---
+
+## Szczegóły naprawy v1.4.0 (model nie ładuje się mimo znalezienia pliku)
+
+### Przyczyna — Android Linker Namespace
+`libggml.so` wywołuje wewnętrznie `ggml_backend_load_all_from_path()`, która używa
+`dlopen()` do załadowania backendu CPU (`libggml-cpu-android_armv*.so`).
+**Problem:** na Androidzie `dlopen()` wywoływane z natywnej biblioteki C działa
+w przestrzeni nazw linkerów tej biblioteki (nie aplikacji). Android nie pozwala
+bibliotekom ładować innych `.so` przez linker namespace, więc backendy CPU nigdy
+nie zostają załadowane → `ggml_backend_reg_count()` = 0 → model zwraca NULL.
+
+### Rozwiązanie — System.load() + dlsym(RTLD_DEFAULT)
+1. **`LlamaAgentApp.kt`** — przy starcie aplikacji iteruje po wszystkich plikach
+   `libggml-cpu-android_*.so` w katalogu `nativeLibraryDir` i ładuje je przez
+   `System.load(fullPath)`. `System.load()` używa ClassLoadera aplikacji z właściwą
+   przestrzenią nazw — biblioteki zostają załadowane poprawnie.
+
+2. **`nativeInitBackends()` w `llama_jni.cpp`** — po załadowaniu `.so` przez Kotlin,
+   JNI używa `dlsym(RTLD_DEFAULT, "ggml_backend_cpu_reg")` aby znaleźć symbol.
+   Po `System.load()` symbol jest dostępny w `RTLD_DEFAULT`. Następnie wywołuje
+   `ggml_backend_cpu_reg()` i `ggml_backend_register()` aby ręcznie zarejestrować
+   backend. Dodatkowo wywołuje `ggml_backend_load_all_from_path()` jako fallback.
+
+### Architektura rozwiązania
+```
+Kotlin (ClassLoader namespace — pełny dostęp do katalogów .so):
+  System.load("/data/app/.../lib/arm64/libggml-cpu-android_armv9.2_1.so") ✓
+
+JNI (po System.load, symbol dostępny w RTLD_DEFAULT):
+  fn_ptr = dlsym(RTLD_DEFAULT, "ggml_backend_cpu_reg") → nie-NULL ✓
+  reg = fn_ptr()
+  ggml_backend_register(reg)  → backend zarejestrowany ✓
+```
+
+### Zmodyfikowane pliki
+- `app/src/main/java/com/llamaagent/LlamaAgentApp.kt` — pełne przepisanie: System.load() loop
+- `app/src/main/cpp/llama_jni.cpp` — nativeInitBackends: dlsym(RTLD_DEFAULT) + ggml_backend_register
