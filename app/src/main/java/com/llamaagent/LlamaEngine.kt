@@ -44,7 +44,21 @@ class LlamaEngine {
 
     companion object {
         init {
+            // Załaduj zależności w odpowiedniej kolejności PRZED główną biblioteką.
+            // Na Androidzie transitive loading działa, ale jawna kolejność jest
+            // wymagana dla backendów GGML ładowanych dynamicznie przez dlopen().
+            System.loadLibrary("ggml-base")
+            System.loadLibrary("ggml")
+            System.loadLibrary("llama")
             System.loadLibrary("llamaagent")
         }
+
+        /**
+         * Załaduj backendy GGML (libggml-cpu-android_*.so) z katalogu natywnych lib.
+         * Wywołaj RAZ przy starcie aplikacji — przed pierwszym nativeInit().
+         * @param nativeLibDir  applicationContext.applicationInfo.nativeLibraryDir
+         */
+        @JvmStatic
+        external fun nativeInitBackends(nativeLibDir: String)
     }
 }

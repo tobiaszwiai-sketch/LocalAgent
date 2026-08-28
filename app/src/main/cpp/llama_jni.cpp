@@ -9,6 +9,7 @@
 #include <sstream>
 
 #include "llama.h"
+#include "ggml-backend.h"
 
 #define TAG "LlamaJNI"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
@@ -118,6 +119,31 @@ static llama_token sample_token(
 }
 
 // ---------------------------------------------------------------------------
+// JNI: ładowanie backendów GGML z katalogu natywnych bibliotek aplikacji
+// Musi być wywołane RAZ przy starcie aplikacji, zanim nativeInit().
+// ---------------------------------------------------------------------------
+static bool g_backends_loaded = false;
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_llamaagent_LlamaEngine_nativeInitBackends(
+        JNIEnv * env, jclass /*clazz*/,
+        jstring nativeLibDir)
+{
+    if (g_backends_loaded) return;
+
+    const char * dir = env->GetStringUTFChars(nativeLibDir, nullptr);
+    LOGI("Ładowanie backendów GGML z: %s", dir);
+    ggml_backend_load_all_from_path(dir);
+    env->ReleaseStringUTFChars(nativeLibDir, dir);
+
+    int n_backends = (int)ggml_backend_reg_count();
+    int n_devices  = (int)ggml_backend_dev_count();
+    LOGI("Załadowano backendów: %d, urządzeń: %d", n_backends, n_devices);
+
+    g_backends_loaded = true;
+}
+
+// ---------------------------------------------------------------------------
 // JNI: inicjalizacja modelu
 // ---------------------------------------------------------------------------
 extern "C" JNIEXPORT jboolean JNICALL
@@ -130,6 +156,8 @@ Java_com_llamaagent_LlamaEngine_nativeInit(
     if (g_model) { llama_model_free(g_model); g_model = nullptr; }
     g_loaded = false;
 
+    // Inicjalizuj backend (jeśli backendów jeszcze nie załadowano ręcznie,
+    // llama_backend_init i tak spróbuje – wymagamy jednak jawnego ładowania)
     llama_backend_init();
 
     const char * path = env->GetStringUTFChars(modelPath, nullptr);

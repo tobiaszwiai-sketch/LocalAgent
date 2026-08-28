@@ -5,9 +5,9 @@
 ---
 
 ## Stan projektu
-- **Wersja:** 1.1.0
+- **Wersja:** 1.2.0
 - **Ostatnia aktualizacja:** 2025-08 przez Claude (Abacus AI Agent)
-- **Status:** ✅ APK skompilowany i gotowy do użycia
+- **Status:** ✅ APK skompilowany — poprawka krytycznego błędu ładowania modelu
 
 ---
 
@@ -172,3 +172,40 @@ Na świeżej maszynie z FetchContent (stare podejście) trwałoby 30-60 minut.
 |------|-------|--------|
 | 2025-08 | Claude (Abacus AI) | Inicjalny projekt, JNI + Compose UI + Agent |
 | 2025-08 | Claude (Abacus AI) | Przejście na prebuilt .so (b10665), fix API llama.cpp, kompilacja APK |
+| 2025-08 | Claude (Abacus AI) | **v1.2.0** — krytyczna poprawka: backend CPU nie ładował się na Androidzie |
+
+---
+
+## Szczegóły naprawy v1.2.0 (błąd "Nie udało się załadować modelu")
+
+### Przyczyna
+`libggml.so` korzysta z `ggml_backend_load_all()` do znalezienia backendów CPU
+(pliki `libggml-cpu-android_armv*.so`). Domyślnie szuka ich przez `/proc/self/exe`
+lub zmienną `GGML_BACKEND_PATH`. **Na Androidzie żadna z tych metod nie działa:**
+`/proc/self/exe` wskazuje na Zygote, nie na katalog `.so` aplikacji.
+Backendy nie były ładowane → model nie miał zdefiniowanego backendu obliczeń →
+`llama_model_load_from_file()` zwracał NULL.
+
+### Rozwiązanie
+1. **Nowa klasa `LlamaAgentApp` (Application)** — wywołuje `LlamaEngine.nativeInitBackends(nativeLibDir)`
+   przy starcie procesu, gdzie `nativeLibDir = applicationInfo.nativeLibraryDir`
+   (np. `/data/app/com.llamaagent-xxx/lib/arm64`).
+
+2. **Nowa funkcja JNI** `Java_com_llamaagent_LlamaEngine_nativeInitBackends` —
+   wywołuje `ggml_backend_load_all_from_path(dir)` z dokładnym katalogiem natywnym.
+
+3. **Jawna kolejność ładowania bibliotek w Kotlin** (companion object init bloku):
+   ```
+   System.loadLibrary("ggml-base")  // bez jawnego ładowania mogą być race conditions
+   System.loadLibrary("ggml")
+   System.loadLibrary("llama")
+   System.loadLibrary("llamaagent")
+   ```
+
+4. **AndroidManifest.xml** — dodano `android:name=".LlamaAgentApp"`.
+
+### Zmodyfikowane pliki
+- `app/src/main/cpp/llama_jni.cpp` — nowa funkcja nativeInitBackends + #include ggml-backend.h
+- `app/src/main/java/com/llamaagent/LlamaEngine.kt` — kolejność loadLibrary + external fun
+- `app/src/main/java/com/llamaagent/LlamaAgentApp.kt` — NOWY plik
+- `app/src/main/AndroidManifest.xml` — android:name=".LlamaAgentApp"
