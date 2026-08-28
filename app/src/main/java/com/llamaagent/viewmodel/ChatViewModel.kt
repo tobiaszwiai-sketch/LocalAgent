@@ -93,14 +93,27 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             }
 
             if (path.isNullOrBlank()) {
+                val allGgufs = ModelStorage.listAllGgufFiles()
+                val found = if (allGgufs.isNotEmpty())
+                    "\n\nZnaleziono inne pliki GGUF:\n" + allGgufs.joinToString("\n") { "• ${it.name}" }
+                else ""
                 _loadState.value = ModelLoadState.Error(
-                    "Nie znaleziono pliku modelu. Pobierz plik GGUF i umieść go w:\n" +
-                        ModelStorage.modelsDir().absolutePath
+                    "Nie znaleziono pliku modelu.\n" +
+                    "Oczekiwana nazwa: ${profile.fileName}\n" +
+                    "Katalog: ${ModelStorage.modelsDir().absolutePath}$found\n\n" +
+                    "Uwaga: Aplikacja szuka pliku też w Download/ (case-insensitive)."
                 )
                 return@launch
             }
             if (!File(path).exists()) {
                 _loadState.value = ModelLoadState.Error("Plik nie istnieje: $path")
+                return@launch
+            }
+            if (!File(path).canRead()) {
+                _loadState.value = ModelLoadState.Error(
+                    "Brak uprawnień do odczytu pliku!\n$path\n\n" +
+                    "Przejdź do: Ustawienia → Aplikacje → LlamaAgent → Uprawnienia → Dostęp do wszystkich plików → Włącz"
+                )
                 return@launch
             }
 
@@ -114,6 +127,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     engine.nativeFree()
                     engine.nativeInit(path, s.threads, s.contextLength)
                 } catch (e: Throwable) {
+                    android.util.Log.e("ChatViewModel", "nativeInit crash: ${e.message}", e)
                     false
                 }
             }
@@ -124,8 +138,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 addSystemMessage("Model \"${profile.name}\" został załadowany. Możesz rozpocząć rozmowę.")
             } else {
                 _loadState.value = ModelLoadState.Error(
-                    "Nie udało się załadować modelu. Możliwe przyczyny: uszkodzony plik GGUF, " +
-                        "za mało pamięci RAM lub nieobsługiwany format."
+                    "Nie udało się załadować modelu.\nPlik: $path\n\n" +
+                    "Sprawdź logcat (tag: LlamaJNI) lub upewnij się że:\n" +
+                    "• Masz uprawnienie 'Dostęp do wszystkich plików' w ustawieniach\n" +
+                    "• Plik GGUF nie jest uszkodzony\n" +
+                    "• Masz wystarczająco RAM (zamknij inne aplikacje)"
                 )
             }
         }

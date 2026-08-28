@@ -46,6 +46,10 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         requestStoragePermissions()
+        // Na Android 11+ poproś o dostęp do wszystkich plików (potrzebne do plików GGUF)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
+            openAllFilesAccess()
+        }
 
         setContent {
             LlamaAgentTheme {

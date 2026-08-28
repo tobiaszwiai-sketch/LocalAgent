@@ -10,6 +10,8 @@
 
 #include "llama.h"
 #include "ggml-backend.h"
+#include <cerrno>
+#include <cstdio>
 
 #define TAG "LlamaJNI"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
@@ -162,15 +164,31 @@ Java_com_llamaagent_LlamaEngine_nativeInit(
 
     const char * path = env->GetStringUTFChars(modelPath, nullptr);
     LOGI("Ładowanie modelu: %s", path);
+    LOGI("Liczba backendów GGML: %d, urządzeń: %d",
+         (int)ggml_backend_reg_count(), (int)ggml_backend_dev_count());
+
+    // Sprawdź dostępność pliku
+    FILE * test_f = fopen(path, "rb");
+    if (!test_f) {
+        LOGE("fopen(%s) failed! errno=%d: %s", path, errno, strerror(errno));
+        env->ReleaseStringUTFChars(modelPath, path);
+        return JNI_FALSE;
+    }
+    fclose(test_f);
+    LOGI("Plik dostępny (fopen OK)");
 
     struct llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = 0; // CPU only na Androidzie
 
+    errno = 0;
     g_model = llama_model_load_from_file(path, mparams);
     env->ReleaseStringUTFChars(modelPath, path);
 
     if (!g_model) {
-        LOGE("Nie udało się załadować modelu!");
+        LOGE("llama_model_load_from_file() zwróciło NULL! errno=%d: %s",
+             errno, strerror(errno));
+        LOGE("Możliwe przyczyny: brak backendów CPU (%d zarejestr.), uszkodzony GGUF, brak RAM",
+             (int)ggml_backend_reg_count());
         return JNI_FALSE;
     }
 
